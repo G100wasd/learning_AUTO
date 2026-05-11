@@ -36,6 +36,8 @@ TARGET_URL = (
 
 # 黑名单课程（自动跳过，不进行刷课）
 BLACKLIST_COURSES = {
+    "常见诈骗—冒充网购客服退款诈骗",
+    "长治久安",
     "差之毫厘谬以千里",
     "预防食物中毒",
     "溺水自救篇",
@@ -92,6 +94,25 @@ def ensure_logged_in(driver):
     time.sleep(3)
 
     if "login" in driver.current_url.lower():
+        if not first_run:
+            # 尝试恢复：可能是页面跳转时序问题，导航回主页重试
+            print("\n  [尝试恢复] 检测到登录页，尝试刷新...")
+            driver.get("https://weiban.mycourse.cn/#/course")
+            time.sleep(4)
+            if "login" not in driver.current_url.lower():
+                print("  [OK] 恢复成功")
+                return "ok"
+
+            # 尝试清除 Cookies 后刷新
+            print("  [尝试恢复] 清除过期 Cookies 后重试...")
+            driver.delete_all_cookies()
+            driver.get("https://weiban.mycourse.cn/")
+            time.sleep(3)
+            if "login" not in driver.current_url.lower():
+                print("  [OK] 恢复成功")
+                return "ok"
+
+        # 所有自动恢复失败，让用户手动登录
         print("\n" + "=" * 55)
         if first_run:
             print("  [首次运行] 请在浏览器中手动登录")
@@ -303,12 +324,11 @@ def click_course(driver, title: str, category_item):
 
 
 def mute_audio(driver):
-    """静音页面中的 audio/video 元素。"""
+    """静音页面中的 audio/video 元素（只静音，不暂停）。"""
     driver.execute_script("""
         document.querySelectorAll('audio, video').forEach(el => {
             el.muted = true;
             el.volume = 0;
-            el.pause();
         });
     """)
 
@@ -365,57 +385,102 @@ def wait_for_video_completion(driver):
                 h: r.height
             };
         """)
-        if video_info and video_info.get("duration") and video_info["duration"] != float("inf"):
+        if video_info and video_info.get("w", 0) > 0 and video_info.get("h", 0) > 0:
             break
         video_info = None
         time.sleep(1)
     if not video_info:
         return False
 
-    duration = video_info["duration"]
-    if not duration or duration == float("inf"):
-        return False
+    print("    [视频] 检测到视频元素")
 
-    print(f"    [视频] 检测到视频，时长 {int(duration)} 秒 ({int(duration // 60)} 分 {int(duration % 60)} 秒)")
-
-    # 先 JS 静音
+    # 先静音
     mute_audio(driver)
     driver.execute_script("""
         var v = document.querySelector('video');
         if (v) { v.muted = true; v.volume = 0; }
     """)
 
-    # 在视频正中心模拟真实点击（ActionChains 产生 isTrusted=true 的事件）
+    # 在视频正中心模拟真实点击（先播放，HLS 视频需要开始加载后才能获取 duration）
     try:
         video_el = driver.find_element(By.TAG_NAME, "video")
         ActionChains(driver).move_to_element(video_el).click().perform()
         print(f"    [视频] 在视频中心({video_info['x']:.0f}, {video_info['y']:.0f})点击播放")
     except Exception:
-        # 兜底：JS 点击
         driver.execute_script("""
             var v = document.querySelector('video');
             if (v) { v.muted = true; if (v.paused) v.play(); }
         """)
         print("    [视频] JS 方式播放")
 
-    # 向上取整等待时间（按 30 秒为单位）+ 15 秒缓冲
-    wait_sec = math.ceil(duration / 30) * 30 + 15
-    print(f"    [视频] 等待 {wait_sec // 60} 分 {wait_sec % 60} 秒...")
+    # 获取 duration（HLS/m3u8 视频在播放前 duration 为 NaN，需等 metadata 加载）
+    duration = video_info.get("duration")
+    if not duration or duration == float("inf"):
+        print("    [视频] 等待视频元数据加载...")
+        for _ in range(8):  # 最多等 16 秒
+            time.sleep(2)
+            duration = driver.execute_script("""
+                var v = document.querySelector('video');
+                return v ? v.duration : null;
+            """)
+            if duration and duration != float("inf"):
+                break
+
+    if duration and duration != float("inf"):
+        print(f"    [视频] 时长 {int(duration)} 秒 ({int(duration // 60)} 分 {int(duration % 60)} 秒)")
+        wait_sec = math.ceil(duration / 30) * 30 + 15
+        had_valid_duration = True
+    else:
+        print("    [视频] 无法获取时长，最多等待 10 分钟")
+        wait_sec = 600
+        had_valid_duration = False
 
     end_time = time.time() + wait_sec
+    last_time = -1
+    stall_count = 0
     while time.time() < end_time:
         status = driver.execute_script("""
             var v = document.querySelector('video');
             if (!v) return { done: true };
-            return { done: v.ended || v.currentTime >= v.duration - 1, currentTime: v.currentTime };
+            return {
+                done: v.ended || (v.currentTime > 0 && v.duration > 0 && v.currentTime >= v.duration - 1),
+                currentTime: v.currentTime
+            };
         """)
         if status.get("done"):
             print(f"    [视频] 播放完成")
             return True
+
+        # 检测视频卡住：currentTime 持续无变化说明已播完或卡住
+        ct = status.get("currentTime", 0)
+        if ct == last_time and ct > 0:
+            stall_count += 1
+        else:
+            stall_count = 0
+        last_time = ct
+        if stall_count >= 15:  # 30 秒没变化
+            print(f"    [视频] 播放似乎已结束 (currentTime={ct:.1f})")
+            return True
+
         time.sleep(2)
 
-    print("    [视频] 等待超时")
-    return False
+    # 超时：区分是网络问题还是正常长视频
+    if not had_valid_duration:
+        print("\n" + "=" * 55)
+        print("  [!] 视频长时间无法加载")
+        print("  [!] 请检查网络环境或代理设置")
+        print("=" * 55)
+        print("\n  可能的原因:")
+        print("  · 网络连接不稳定")
+        print("  · 代理/VPN 拦截了视频请求")
+        print("  · 平台视频服务器不可达")
+        print("  · 浏览器需要登录验证（尝试手动打开一次视频页面）")
+        print("\n  ⚠ 排查网络问题后重新运行程序\n")
+        input("按 Enter 退出...")
+        sys.exit(1)
+    else:
+        print("    [视频] 等待超时")
+        return False
 
 
 def try_click_bottom_area(driver):
@@ -649,9 +714,10 @@ def click_next_or_btn(driver) -> str:
     """
     基于 .page-active 切换的翻页逻辑：
       1. 全局搜"返回列表"按钮（优先检测课程结束）
-      2. 若 .page-end 激活 → 点 a.back-list → "return_list"
-      3. 若普通 page 激活 → 点 a.btn-next → "next_page"
-      4. 无匹配 → "not_found"
+      2. 检测 active section 中的 page-test-btn（进入答题页）
+      3. 若 .page-end 激活 → 点 a.back-list → "return_list"
+      4. 若普通 page 激活 → 点 a.btn-next → "next_page"
+      5. 无匹配 → "not_found"
     """
     # 优先检查"返回列表"按钮（必须在可视范围内）
     for sel in ("button.comment-footer-button",
@@ -687,6 +753,15 @@ def click_next_or_btn(driver) -> str:
     active = get_active_section(driver)
     if not active:
         return "not_found"
+
+    # 检测 page-test-btn（进入答题的特殊按钮，无标准翻页按钮）
+    try:
+        test_btn = active.find_element(By.CSS_SELECTOR, "span.page-test-btn")
+        driver.execute_script("arguments[0].click()", test_btn)
+        time.sleep(2)
+        return "next_page"
+    except NoSuchElementException:
+        pass
 
     classes = active.get_attribute("class") or ""
     is_end = "page-end" in classes.split()
@@ -1412,6 +1487,16 @@ def auto_complete(driver, all_courses: list[dict]):
                     print(f"  [OK] 已完成 ({completed}/{total_unfinished})")
                 else:
                     failed_courses.append(course_title)
+
+                # 课程完成后检查是否被踢到登录页，是则尝试恢复
+                time.sleep(2)
+                if "login" in driver.current_url.lower():
+                    print("  [!] 检测到登录页，尝试恢复...")
+                    login_result = ensure_logged_in(driver)
+                    if login_result == "failed":
+                        print("  [!] 恢复失败，终止运行")
+                        break
+                    print("  [OK] 已恢复，继续下一课")
                     print(f"  [!] 课程失败 ({completed}/{total_unfinished})")
 
                 # 回到课程列表继续下一个
