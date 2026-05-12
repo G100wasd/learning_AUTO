@@ -85,68 +85,52 @@ def is_session_valid(driver):
         return False
 
 
-def wait_for_manual_login(driver):
-    """打开统一登录页面，等待用户手动完成登录后按 Enter 继续"""
-    print("\n======================")
-    print("> 首次使用或Cookie已过期，需要手动登录")
-    print("> 请在弹出的浏览器窗口中完成东莞理工学院统一身份认证登录")
-    print("> 登录完成后，请按 Enter 键继续...")
-    print("======================\n")
-
-    driver.get(LOGIN_URL)
-    t.sleep(2)
-    input()
-
-    print("> 跳转到课程列表页面...")
-    driver.get(COURSE_LIST_URL)
-    t.sleep(3)
-
-
 def perform_login(driver):
-    """执行登录：优先使用保存的cookie，失败则触发手动登录流程"""
+    """尝试使用已保存的Cookie自动登录，成功返回cookie列表，失败返回None"""
     saved_cookies = load_cookies_from_file()
-    if saved_cookies:
-        print("\n======================")
-        print("> 检测到已保存的Cookie，尝试自动登录")
-        driver.get(BASE_URL)
-        t.sleep(2)
+    if not saved_cookies:
+        return None
 
-        success_count = 0
-        for cookie in saved_cookies:
-            try:
-                driver.add_cookie(cookie)
-                success_count += 1
-            except:
-                pass
-        driver.refresh()
+    print("\n======================")
+    print("> 检测到已保存的Cookie，尝试自动登录")
+    driver.get(BASE_URL)
+    t.sleep(2)
+
+    success_count = 0
+    for cookie in saved_cookies:
+        try:
+            driver.add_cookie(cookie)
+            success_count += 1
+        except:
+            pass
+    driver.refresh()
+    t.sleep(3)
+    print(f"> 已注入 {success_count} 个Cookie")
+
+    if is_session_valid(driver):
+        print("> 自动登录成功！")
+        driver.get(COURSE_LIST_URL)
         t.sleep(3)
-        print(f"> 已注入 {success_count} 个Cookie")
-
-        if is_session_valid(driver):
-            print("> 自动登录成功！")
-            driver.get(COURSE_LIST_URL)
-            t.sleep(3)
-            return saved_cookies
-        else:
-            print("> Cookie已过期，需要重新登录")
-
-    wait_for_manual_login(driver)
-
-    return save_cookies_to_file(driver)
+        return saved_cookies
+    else:
+        print("> Cookie已过期")
+        return None
 
 
 # ========== 浏览器初始化 ==========
 
-def init_driver():
-    """初始化Edge无头浏览器，返回 driver 和 actions"""
+def init_driver(headless=True):
+    """初始化Edge浏览器，headless=False 时有界面模式用于首次登录"""
+    mode = "无头" if headless else "有界面"
     print("\n======================")
-    print("> 正在以无头浏览器模式运行")
+    print(f"> 正在以{mode}浏览器模式运行")
     print("> 正在进行初始化")
     try:
         qt = Options()
         qt.add_argument("--no-sandbox")
         qt.add_argument("--disable-gpu")
-        qt.add_argument('--headless')
+        if headless:
+            qt.add_argument('--headless')
         qt.add_argument('--disable-blink-features=AutomationControlled')
         qt.add_argument('--window-size=1920,1080')
         qt.add_argument('--lang=zh-CN')
@@ -164,7 +148,7 @@ def init_driver():
         print("> 失败")
         print(f"> 发生报错:\n{e}")
         print("> 程序已退出")
-        quit()
+        sys.exit()
 
 
 # ========== 认证修复 ==========
@@ -652,10 +636,10 @@ def select_course(driver):
         choice = int(input("\n请输入课程编号（输入数字后按 Enter）: "))
         if choice < 1 or choice > len(course_wrappers):
             print("> 编号超出范围，程序退出")
-            quit()
+            sys.exit()
     except ValueError:
         print("> 输入无效，程序退出")
-        quit()
+        sys.exit()
 
     selected = course_wrappers[choice - 1]
     course_item = selected.find_element(By.CLASS_NAME, 'course-item')
@@ -670,7 +654,7 @@ def select_course(driver):
 
 def main():
     # 开场
-    # print_disclaimer()
+    print_disclaimer()
     print_banner()
 
     # 检查驱动是否存在
@@ -681,14 +665,50 @@ def main():
         print("> 然后将 msedgedriver.exe 放在程序同目录下")
         print("======================\n")
         input("按 Enter 键退出...")
-        quit()
+        sys.exit()
 
-    # 初始化
-    driver, actions = init_driver()
+    # ===== 登录流程 =====
+    saved_cookies = load_cookies_from_file()
 
-    # 自动登录（优先使用保存的cookie，否则手动登录）
+    if not saved_cookies:
+        # 首次使用：有界面模式登录获取Cookie
+        print("\n======================")
+        print("> 首次使用，请在弹出的浏览器窗口中完成登录")
+        print("======================")
+        driver, actions = init_driver(headless=False)
+        driver.get(LOGIN_URL)
+        t.sleep(2)
+        input("\n登录完成后请按 Enter 键继续...")
+        # 跳转到课程列表确保Cookie完整
+        driver.get(COURSE_LIST_URL)
+        t.sleep(3)
+        save_cookies_to_file(driver)
+        driver.quit()
+        print("\n======================")
+        print("> 首次登录完成，请重新启动程序开始自动刷课")
+        print("======================")
+        input("按 Enter 键退出...")
+        sys.exit()
+
+    # 有Cookie：无头模式自动登录
+    driver, actions = init_driver(headless=True)
     all_cookies = perform_login(driver)
 
+    if all_cookies is None:
+        # Cookie过期
+        driver.quit()
+        try:
+            os.remove(COOKIE_FILE)
+            print("> 已删除过期的Cookie文件")
+        except:
+            pass
+        print("\n======================")
+        print("> Cookie已过期，请重新启动程序并重新登录")
+        print("======================")
+        input("按 Enter 键退出...")
+        sys.exit()
+
+    # ===== 登录成功，开始刷课 =====
     # 课程选择
     select_course(driver)
 
@@ -740,8 +760,16 @@ def main():
     t.sleep(600)
     print("<程序已经运行结束>")
     driver.quit()
-    quit()
+    sys.exit()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("\n======================")
+        print("> 程序运行出错：")
+        traceback.print_exc()
+        print("======================")
+        input("\n按 Enter 键退出...")
