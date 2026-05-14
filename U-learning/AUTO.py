@@ -20,11 +20,15 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-COOKIE_FILE = os.path.join(BASE_DIR, 'cookies.json')
+COOKIE_DIR = os.path.join(BASE_DIR, 'cookies')
 DRIVER_PATH = os.path.join(BASE_DIR, 'msedgedriver.exe')
+CUR_PHOTO_BASE = os.path.join(BASE_DIR, 'cur_photo')
 COURSE_LIST_URL = "https://lms.dgut.edu.cn/ulearning/index.html#/index/courseList"
 LOGIN_URL = "https://auth.dgut.edu.cn/authserver/login?service=https://application.dgut.edu.cn/appapi/cas/fromcas"
 BASE_URL = "https://lms.dgut.edu.cn/ulearning"
+
+# 当前截图保存目录（由选中的cookie文件名决定，运行时动态设置）
+CUR_PHOTO_DIR = None
 
 
 # ========== 工具函数 ==========
@@ -35,6 +39,7 @@ def print_disclaimer():
     for i in ["运行前请检查同路径下是否包含mesdgedriver.exe 这是浏览器驱动 没有的话无法运行", "因为这个项目是基于edge浏览器写的 所以如果你是从谷歌浏览器获取的cookie 可能会有些神秘的bug?", "这个项目的参考是基于dgut2025级信科1班的形策课件写的 包含刷视频和自动答题的功能 所以如果用户的刷课要求包含其他题目 会失败的 如果可以的话请提交以下issues", "最后 输入cookie和网址时请检查一下输入是否正确", "刷课一旦开始就是默认完成所有的任务 所以如果你有什么想要手动的? 可能得手动中断(ctrl+c)"]:
         print(f"叠甲{j}:\n{i}")
         j += 1
+        #t.sleep(1)
 
 
 def print_banner():
@@ -54,7 +59,7 @@ def print_banner():
     print("╚════╝╚════╝╚════╝╚════╝╚════╝╚════╝╚════╝╚════╝╚════╝╚════╝╚════╝")
 
 
-def save_cookies_to_file(driver, filepath=COOKIE_FILE):
+def save_cookies_to_file(driver, filepath):
     """保存当前浏览器cookies到文件，返回cookie列表"""
     cookies = driver.get_cookies()
     print("\n> 收集到以下Cookie:")
@@ -66,12 +71,20 @@ def save_cookies_to_file(driver, filepath=COOKIE_FILE):
     return cookies
 
 
-def load_cookies_from_file(filepath=COOKIE_FILE):
+def load_cookies_from_file(filepath):
     """从文件加载cookies，文件不存在时返回None"""
     if not os.path.exists(filepath):
         return None
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+def list_cookie_files():
+    """列出cookies文件夹下所有json文件，不存在时返回空列表"""
+    if not os.path.exists(COOKIE_DIR):
+        return []
+    files = [f for f in os.listdir(COOKIE_DIR) if f.endswith('.json')]
+    return sorted(files)
 
 
 def is_session_valid(driver):
@@ -85,17 +98,20 @@ def is_session_valid(driver):
         return False
 
 
-def perform_login(driver):
+def perform_login(driver, cookie_path):
     """尝试使用已保存的Cookie自动登录，成功返回cookie列表，失败返回None"""
-    saved_cookies = load_cookies_from_file()
+    saved_cookies = load_cookies_from_file(cookie_path)
     if not saved_cookies:
         return None
 
     print("\n======================")
     print("> 检测到已保存的Cookie，尝试自动登录")
+
+    # 先导航到目标域，使浏览器与域名建立关联
     driver.get(BASE_URL)
     t.sleep(2)
 
+    # 使用标准Selenium API注入cookie，确保domain自动匹配当前页面
     success_count = 0
     for cookie in saved_cookies:
         try:
@@ -113,7 +129,7 @@ def perform_login(driver):
         t.sleep(3)
         return saved_cookies
     else:
-        print("> Cookie已过期")
+        print("> Cookie已过期或登录失败")
         return None
 
 
@@ -131,6 +147,7 @@ def init_driver(headless=True):
         qt.add_argument("--disable-gpu")
         if headless:
             qt.add_argument('--headless')
+            pass
         qt.add_argument('--disable-blink-features=AutomationControlled')
         qt.add_argument('--window-size=1920,1080')
         qt.add_argument('--lang=zh-CN')
@@ -148,6 +165,7 @@ def init_driver(headless=True):
         print("> 失败")
         print(f"> 发生报错:\n{e}")
         print("> 程序已退出")
+        input("\n按 Enter 键退出...")
         sys.exit()
 
 
@@ -173,11 +191,14 @@ def fix_auth_issue(driver, all_cookies):
         except:
             pass
     try:
+        # 从已注入的cookie中提取实际值，替代硬编码
+        token_val = next((c['value'] for c in new_window_cookies if c['name'] == 'token'), '')
+        auth_val = next((c['value'] for c in new_window_cookies if c['name'] == 'AUTHORIZATION'), '')
         driver.execute_script("""
-            localStorage.setItem('token', 'D9C8E6D3D66FDEE7239B26544E5A74F6');
-            localStorage.setItem('AUTHORIZATION', 'D9C8E6D3D66FDEE7239B26544E5A74F6');
+            localStorage.setItem('token', arguments[0]);
+            localStorage.setItem('AUTHORIZATION', arguments[1]);
             localStorage.setItem('userInfo', document.cookie.match(/USER_INFO=([^;]+)/)?.[1] || '');
-        """)
+        """, token_val, auth_val)
         driver.execute_script("""
             var failedResources = ['User.js', 'Course.js'];
             failedResources.forEach(function(resource) {
@@ -354,7 +375,7 @@ def play_single_video(driver, actions, video_element):
         t.sleep(60 if i < loops - 1 else (remain_sec % 60 or 60))
         actions.click(video_play_btn).perform()
         print(f"\r>   防挂机检测X{i + 1}", end="", flush=True)
-        driver.save_screenshot(os.path.join(BASE_DIR, "cur_vedio.png"))
+        driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
         t.sleep(1)
         actions.click(video_play_btn).perform()
     t.sleep(1)
@@ -487,7 +508,7 @@ def process_page_item(driver, actions, page_item):
         except ElementClickInterceptedException:
             skip_all_tips(driver)
             t.sleep(1)
-    driver.save_screenshot(os.path.join(BASE_DIR, "cur_start.png"))
+    driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_start.png"))
     t.sleep(2)
 
     # 跳过可能出现的引导弹窗
@@ -497,7 +518,7 @@ def process_page_item(driver, actions, page_item):
     if not handle_video_content(driver, actions):
         handle_question_content(driver, actions)
 
-    driver.save_screenshot(os.path.join(BASE_DIR, "cur_end.png"))
+    driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_end.png"))
     print("-----------------------")
     t.sleep(1)
 
@@ -550,8 +571,20 @@ def process_chapters(driver, actions, chapter_list, start_index):
 
 # ========== 学习流程 - 学习选项卡处理 ==========
 
+def click_back_save(driver):
+    """所有专题完成后，点击返回课程章节按钮保存进度，循环3次"""
+    for i in range(3):
+        try:
+            back_btn = driver.find_element(By.CLASS_NAME, 'back-btn')
+            driver.execute_script("arguments[0].click();", back_btn)
+            print(f"> 点击返回保存({i+1}/3)")
+        except:
+            print(f"> 返回按钮未找到({i+1}/3)")
+        t.sleep(5)
+
+
 def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
-    """处理单个学习选项卡"""
+    """处理单个学习选项卡（自动遍历所有未完成章节）"""
     handle = driver.current_window_handle
     print("\n-----------------------")
     if is_list:
@@ -559,54 +592,59 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
         actions.click(learn_page).perform()
         t.sleep(2)
 
-    # 查找章节列表（课件页面 table 结构）
-    chapter_rows = driver.find_elements(By.XPATH, '//tr[starts-with(@id, "chapterTr")]')
-    if not chapter_rows:
-        print("> 未找到章节列表，请检查页面是否加载完整")
-        return
+    while True:
+        # 每次循环重新获取章节列表（DOM已刷新）
+        chapter_rows = driver.find_elements(By.XPATH, '//tr[starts-with(@id, "chapterTr")]')
+        if not chapter_rows:
+            print("> 未找到章节列表，请检查页面是否加载完整")
+            break
 
-    # 寻找第一个未完成章节
-    index = -1
-    for count, row in enumerate(chapter_rows):
-        try:
-            progress_span = row.find_element(By.XPATH, './/td[2]/span')
-            progress = int(progress_span.text.strip('%'))
-            if progress != 100:
-                print("> 检测到未完成项目")
-                print(f"  {row.find_element(By.CLASS_NAME, 'tabchapter-name').text} — 进度: {progress}%")
-                print("> 以该项目为起点")
-                index = count
-                break
-        except:
-            pass
+        # 查找下一个未完成章节
+        index = -1
+        for count, row in enumerate(chapter_rows):
+            try:
+                progress_span = row.find_element(By.XPATH, './/td[2]/span')
+                progress = int(progress_span.text.strip('%'))
+                if progress != 100:
+                    if index == -1:
+                        print("> 检测到未完成项目")
+                        print(f"  {row.find_element(By.CLASS_NAME, 'tabchapter-name').text} — 进度: {progress}%")
+                    index = count
+                    break
+            except:
+                pass
 
-    if index == -1:
-        print("> 当前界面已全部完成")
-        print("-----------------------")
-        return
+        if index == -1:
+            print("> 当前界面已全部完成")
+            print("-----------------------")
+            break
 
-    learn_btn = chapter_rows[index].find_elements(By.CLASS_NAME, 'button-red-hollow')
-    if not learn_btn:
-        print("> 未找到开始学习按钮")
-        return
-    actions.click(learn_btn[0]).perform()
+        learn_btn = chapter_rows[index].find_elements(By.CLASS_NAME, 'button-red-hollow')
+        if not learn_btn:
+            print("> 未找到开始学习按钮")
+            break
+        actions.click(learn_btn[0]).perform()
 
-    # 处理新窗口的 undefined/401
-    handle_new_window(driver, all_cookies)
+        # 处理新窗口的 undefined/401
+        handle_new_window(driver, all_cookies)
 
-    # 跳过提示
-    skip_all_tips(driver)
+        # 跳过提示
+        skip_all_tips(driver)
 
-    # 获取专题列表
-    chapter_list = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
-    print(f"> 该部分有{len(chapter_list)}个专题")
+        # 获取专题列表
+        chapter_list = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
+        print(f"> 该部分有{len(chapter_list)}个专题")
 
-    process_chapters(driver, actions, chapter_list, index)
+        process_chapters(driver, actions, chapter_list, index)
 
-    t.sleep(10)
-    driver.close()
-    t.sleep(1)
-    driver.switch_to.window(handle)
+        # 所有专题处理完毕，点击返回按钮保存
+        click_back_save(driver)
+
+        t.sleep(10)
+        driver.close()
+        t.sleep(1)
+        driver.switch_to.window(handle)
+        # 回到主窗口后重新开始 while 循环，查找下一个未完成章节
 
 
 # ========== 课程选择 ==========
@@ -636,9 +674,11 @@ def select_course(driver):
         choice = int(input("\n请输入课程编号（输入数字后按 Enter）: "))
         if choice < 1 or choice > len(course_wrappers):
             print("> 编号超出范围，程序退出")
+            input("\n按 Enter 键退出...")
             sys.exit()
     except ValueError:
         print("> 输入无效，程序退出")
+        input("\n按 Enter 键退出...")
         sys.exit()
 
     selected = course_wrappers[choice - 1]
@@ -653,7 +693,6 @@ def select_course(driver):
 # ========== 主函数 ==========
 
 def main():
-    # 开场
     print_disclaimer()
     print_banner()
 
@@ -667,44 +706,98 @@ def main():
         input("按 Enter 键退出...")
         sys.exit()
 
-    # ===== 登录流程 =====
-    saved_cookies = load_cookies_from_file()
+    # ===== Cookie 选择 / 登录流程 =====
+    cookie_files = list_cookie_files()
 
-    if not saved_cookies:
-        # 首次使用：有界面模式登录获取Cookie
+    if cookie_files:
         print("\n======================")
-        print("> 首次使用，请在弹出的浏览器窗口中完成登录")
+        print("> 检测到以下已保存的Cookie：")
+        for idx, fname in enumerate(cookie_files, 1):
+            name = fname.replace('.json', '')
+            print(f"  {idx}. {name}")
+        print("  0. 添加新的Cookie（重新登录）")
+        print("======================")
+
+        try:
+            choice = int(input("\n请选择要使用的Cookie（输入数字后按 Enter）: "))
+        except ValueError:
+            print("> 输入无效，程序退出")
+            input("\n按 Enter 键退出...")
+            sys.exit()
+
+        if choice == 0:
+            all_cookies = None
+        elif 1 <= choice <= len(cookie_files):
+            cookie_name = cookie_files[choice - 1].replace('.json', '')
+            selected_path = os.path.join(COOKIE_DIR, cookie_files[choice - 1])
+            driver, actions = init_driver(headless=True)
+            all_cookies = perform_login(driver, selected_path)
+            if all_cookies is None:
+                driver.quit()
+                print("\n======================")
+                print("> Cookie已过期或登录失败")
+                print("> 请重新启动程序并选择其他Cookie或重新登录")
+                print("======================")
+                input("按 Enter 键退出...")
+                sys.exit()
+            # 设置截图保存目录
+            global CUR_PHOTO_DIR
+            CUR_PHOTO_DIR = os.path.join(CUR_PHOTO_BASE, cookie_name)
+            os.makedirs(CUR_PHOTO_DIR, exist_ok=True)
+            print(f"> 截图将保存到: {CUR_PHOTO_DIR}")
+        else:
+            print("> 编号超出范围，程序退出")
+            input("\n按 Enter 键退出...")
+            sys.exit()
+    else:
+        all_cookies = None
+
+    if all_cookies is None:
+        # 首次使用 / 添加新Cookie：有界面模式登录获取Cookie
+        print("\n======================")
+        print("> 请在弹出的浏览器窗口中完成登录")
         print("======================")
         driver, actions = init_driver(headless=False)
         driver.get(LOGIN_URL)
         t.sleep(2)
         input("\n登录完成后请按 Enter 键继续...")
-        # 跳转到课程列表确保Cookie完整
         driver.get(COURSE_LIST_URL)
         t.sleep(3)
-        save_cookies_to_file(driver)
-        driver.quit()
-        print("\n======================")
-        print("> 首次登录完成，请重新启动程序开始自动刷课")
-        print("======================")
-        input("按 Enter 键退出...")
-        sys.exit()
 
-    # 有Cookie：无头模式自动登录
-    driver, actions = init_driver(headless=True)
-    all_cookies = perform_login(driver)
-
-    if all_cookies is None:
-        # Cookie过期
+        # 保存Cookie到cookies文件夹（从cookie中提取标识作为文件名）
+        os.makedirs(COOKIE_DIR, exist_ok=True)
+        cookies_data = driver.get_cookies()
+        # 从USERINFO中提取 userId_name_userNo 作为文件名
+        cookie_name = ""
+        for c in cookies_data:
+            if c['name'] == 'USERINFO':
+                try:
+                    import urllib.parse
+                    decoded = urllib.parse.unquote(c['value'])
+                    info = json.loads(decoded)
+                    user_id = info.get('userId', '')
+                    name = info.get('name', '')
+                    user_no = info.get('userNo', '')
+                    cookie_name = f"{user_id}_{name}_{user_no}"
+                except:
+                    pass
+                break
+        if not cookie_name:
+            cookie_name = f"cookie_{t.strftime('%Y%m%d_%H%M%S')}"
+        cookie_path = os.path.join(COOKIE_DIR, f"{cookie_name}.json")
+        with open(cookie_path, 'w', encoding='utf-8') as f:
+            json.dump(cookies_data, f, ensure_ascii=False, indent=2)
+        print(f"> 共 {len(cookies_data)} 个Cookie已保存到 {cookie_path}")
         driver.quit()
-        try:
-            os.remove(COOKIE_FILE)
-            print("> 已删除过期的Cookie文件")
-        except:
-            pass
-        print("\n======================")
-        print("> Cookie已过期，请重新启动程序并重新登录")
-        print("======================")
+
+        if cookie_files:
+            print("\n======================")
+            print("> 新Cookie已保存，请重新启动程序使用")
+            print("======================")
+        else:
+            print("\n======================")
+            print("> 首次登录完成，请重新启动程序开始自动刷课")
+            print("======================")
         input("按 Enter 键退出...")
         sys.exit()
 
@@ -747,7 +840,6 @@ def main():
     # 遍历并输出当前课件的学习界面
     learn_list, is_list = get_learn_tabs(driver)
 
-    # input("\n按 Enter 开始自动刷课...\n")
     t.sleep(5)
 
     # 进入主流程
@@ -766,10 +858,10 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Exception as e:
+    except SystemExit:
+        pass
+    except:
         import traceback
-        print("\n======================")
-        print("> 程序运行出错：")
         traceback.print_exc()
-        print("======================")
+        print("\n> 出现未预期的错误，窗口即将关闭")
         input("\n按 Enter 键退出...")
