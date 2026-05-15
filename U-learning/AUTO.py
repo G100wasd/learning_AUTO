@@ -152,11 +152,12 @@ def init_driver(headless=True):
         qt.add_argument('--window-size=1920,1080')
         qt.add_argument('--lang=zh-CN')
         qt.add_argument('--log-level=3')
+        qt.add_argument('--silent')
         qt.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0')
         qt.add_experimental_option("excludeSwitches", ["enable-automation"])
         qt.add_experimental_option("useAutomationExtension", False)
         qt.add_experimental_option(name='detach', value=True)
-        driver = webdriver.Edge(service=Service(DRIVER_PATH, log_output=os.devnull), options=qt)
+        driver = webdriver.Edge(service=Service(DRIVER_PATH, log_output=os.devnull, service_args=['--silent']), options=qt)
         actions = ActionChains(driver)
         print(os.getcwd())
         print("> 成功")
@@ -356,28 +357,34 @@ def play_single_video(driver, actions, video_element):
     print(">   已自动播放")
     t.sleep(5)
 
-    # 计算还需等待的秒数 = 总时长 - 已播放 + 30
-    video_current_time = video_control.find_element(By.CLASS_NAME, 'mejs__currenttime-container').find_element(By.XPATH, './span').text
+    # 输出视频总时长信息
     video_time = video_control.find_element(By.CLASS_NAME, 'mejs__duration-container').find_element(By.XPATH, './span').text
     total_sec = _parse_seconds(video_time)
-    current_sec = _parse_seconds(video_current_time)
-    remain_sec = total_sec - current_sec + 30
-    if remain_sec < 0:
-        remain_sec = 0
-    print(f">   视频时长: {video_time}")
-    print(f">   已播放: {video_current_time}")
-    print(f">   还需等待: {remain_sec}秒")
-    t.sleep(1)
+    # 向上取整到整分钟，余数 > 30s 再加 1 分钟
+    base = ((total_sec + 59) // 60) * 60
+    remain_sec = base + (60 if total_sec % 60 > 30 else 0)
+    print(f">   视频时长: {video_time}（整为 {remain_sec // 60} 分钟）")
 
-    # 每60秒暂停一次以防挂机检测
-    loops = (remain_sec + 59) // 60  # 向上取整
-    for i in range(loops):
-        t.sleep(60 if i < loops - 1 else (remain_sec % 60 or 60))
+    # 每60秒检测一次视频是否播完（播完后进度条自动归 00:00）
+    check_count = 0
+    while check_count * 60 < remain_sec:
+        t.sleep(60)
+        # 先读取时间再操作，防止播完后误触发 replay
+        try:
+            cur_text = driver.find_element(By.CLASS_NAME, 'mejs__currenttime-container').find_element(By.XPATH, './span').text
+        except:
+            cur_text = ""
+        if cur_text == "00:00":
+            print("\n>   视频已看完")
+            driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
+            return
+        # 防挂机：暂停 → 截图 → 恢复
         actions.click(video_play_btn).perform()
-        print(f"\r>   防挂机检测X{i + 1}", end="", flush=True)
-        driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
         t.sleep(1)
+        driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
         actions.click(video_play_btn).perform()
+        check_count += 1
+        print(f"\r>   防挂机检测X{check_count}", end="", flush=True)
     t.sleep(1)
 
 
@@ -545,13 +552,14 @@ def process_chapters(driver, actions, chapter_list, start_index):
 
         # 第一个专题从课表点进来时已默认展开，不需要再点
         if chapter_idx > start_index:
-            # 跳过弹窗再展开专题（带重试，防止弹窗在点击瞬间出现）
+            # 跳过弹窗再展开专题（带重试 + 显式等待，防止元素未渲染完成）
+            chapter_name_el = chapter_item.find_element(By.CLASS_NAME, 'chapter-name')
             for _ in range(5):
                 try:
-                    skip_all_tips(driver)
-                    chapter_item.find_element(By.CLASS_NAME, 'chapter-name').click()
+                    WebDriverWait(driver, 5).until(EC.element_to_be_clickable(chapter_name_el))
+                    chapter_name_el.click()
                     break
-                except ElementClickInterceptedException:
+                except (ElementClickInterceptedException, ElementNotInteractableException):
                     skip_all_tips(driver)
                     t.sleep(1)
         else:
@@ -745,6 +753,7 @@ def main():
             CUR_PHOTO_DIR = os.path.join(CUR_PHOTO_BASE, cookie_name)
             os.makedirs(CUR_PHOTO_DIR, exist_ok=True)
             print(f"> 截图将保存到: {CUR_PHOTO_DIR}")
+            os.system(f'title {cookie_name}')
         else:
             print("> 编号超出范围，程序退出")
             input("\n按 Enter 键退出...")
