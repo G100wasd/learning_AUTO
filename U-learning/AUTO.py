@@ -90,7 +90,9 @@ def list_cookie_files():
 def is_session_valid(driver):
     """检查当前lms.dgut.edu.cn会话是否有效"""
     try:
-        t.sleep(2)
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
         if 'auth.dgut.edu.cn' in driver.current_url:
             return False
         return True
@@ -126,7 +128,13 @@ def perform_login(driver, cookie_path):
     if is_session_valid(driver):
         print("> 自动登录成功！")
         driver.get(COURSE_LIST_URL)
-        t.sleep(3)
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CLASS_NAME, 'course-item-wrapper'))
+            )
+            print("> 课程列表加载完成")
+        except:
+            print("> 警告：课程列表加载超时，尝试继续...")
         return saved_cookies
     else:
         print("> Cookie已过期或登录失败")
@@ -371,7 +379,7 @@ def play_single_video(driver, actions, video_element):
         t.sleep(60)
         # 先读取时间再操作，防止播完后误触发 replay
         try:
-            cur_text = driver.find_element(By.CLASS_NAME, 'mejs__currenttime-container').find_element(By.XPATH, './span').text
+            cur_text = video_control.find_element(By.CLASS_NAME, 'mejs__currenttime-container').find_element(By.XPATH, './span').text
         except:
             cur_text = ""
         if cur_text == "00:00":
@@ -591,6 +599,41 @@ def click_back_save(driver):
         t.sleep(5)
 
 
+def print_chapter_list(driver):
+    """打印当前学习界面的章节列表"""
+    chapter_rows = driver.find_elements(By.XPATH, '//tr[starts-with(@id, "chapterTr")]')
+    if not chapter_rows:
+        print("> 未检测到章节列表")
+        return chapter_rows
+
+    print("> 课件章节列表：\n")
+    for row in chapter_rows:
+        try:
+            name = row.find_element(By.CLASS_NAME, 'tabchapter-name').text
+        except:
+            name = "未知章节"
+        try:
+            progress = row.find_element(By.XPATH, './/td[2]/span').text
+        except:
+            progress = "--"
+        try:
+            time = row.find_element(By.XPATH, './/td[3]').text
+        except:
+            time = "--"
+        try:
+            score = row.find_element(By.XPATH, './/td[4]').text
+        except:
+            score = "--"
+        try:
+            btn_text = row.find_element(By.CLASS_NAME, 'button-red-hollow').text
+        except:
+            btn_text = "--"
+        print(f"  {name}")
+        print(f"    进度: {progress}  学时: {time}  得分: {score}  [{btn_text}]")
+    print(f"\n> 共 {len(chapter_rows)} 个章节")
+    return chapter_rows
+
+
 def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
     """处理单个学习选项卡（自动遍历所有未完成章节）"""
     handle = driver.current_window_handle
@@ -600,9 +643,37 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
         actions.click(learn_page).perform()
         t.sleep(2)
 
+    # 等待并打印当前学习界面的完整章节列表
+    for attempt in range(3):
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, '//tr[starts-with(@id, "chapterTr")]'))
+            )
+            break
+        except:
+            if attempt < 2:
+                print(f"> 章节列表未加载，正在刷新重试({attempt+1}/2)...")
+                driver.refresh()
+                t.sleep(3)
+    print_chapter_list(driver)
+    print("-----------------------")
+
     while True:
-        # 每次循环重新获取章节列表（DOM已刷新）
-        chapter_rows = driver.find_elements(By.XPATH, '//tr[starts-with(@id, "chapterTr")]')
+        # 每次循环重新获取章节列表（DOM已刷新），带等待和重试
+        chapter_rows = []
+        for attempt in range(3):
+            try:
+                chapter_rows = WebDriverWait(driver, 10).until(
+                    lambda _: driver.find_elements(By.XPATH, '//tr[starts-with(@id, "chapterTr")]')
+                )
+                if chapter_rows:
+                    break
+            except:
+                pass
+            if attempt < 2:
+                print(f"> 章节列表未加载，正在刷新重试({attempt+1}/2)...")
+                driver.refresh()
+                t.sleep(3)
         if not chapter_rows:
             print("> 未找到章节列表，请检查页面是否加载完整")
             break
@@ -639,7 +710,13 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
         # 跳过提示
         skip_all_tips(driver)
 
-        # 获取专题列表
+        # 获取专题列表（等待页面渲染完成）
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CLASS_NAME, 'catalog-list'))
+            )
+        except:
+            print("> 警告：catalog-list 加载超时")
         chapter_list = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
         print(f"> 该部分有{len(chapter_list)}个专题")
 
@@ -658,30 +735,74 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
 # ========== 课程选择 ==========
 
 def select_course(driver):
-    """遍历课程列表，输出课程名，等待用户选择"""
-    t.sleep(2)
-    course_wrappers = driver.find_elements(By.CLASS_NAME, 'course-item-wrapper')
-    if not course_wrappers:
-        print("> 未找到课程列表，请检查页面是否加载完整")
+    """遍历所有分页收集完整课程列表，输出课程名，等待用户选择"""
+    courses = []       # [(title, course_id), ...]
+    seen_ids = set()
+
+    # 先等待第一页加载
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CLASS_NAME, 'course-item-wrapper'))
+        )
+    except:
+        print("> 课程列表加载超时，请检查页面是否加载完整")
         return
+
+    while True:
+        t.sleep(1)
+
+        # 收集当前页的课程
+        wrappers = driver.find_elements(By.CLASS_NAME, 'course-item-wrapper')
+        for w in wrappers:
+            try:
+                course_item = w.find_element(By.CLASS_NAME, 'course-item')
+                cid = course_item.get_attribute('id')          # e.g. "courseCard155382"
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    title = w.find_element(By.CLASS_NAME, 'title').text
+                    courses.append((title, cid.replace('courseCard', '')))
+            except:
+                pass
+
+        # 尝试翻到下一页
+        try:
+            pagination = driver.find_element(By.ID, 'courseListPagination')
+            active_before = pagination.find_element(By.CLASS_NAME, 'active').text
+            next_btn = pagination.find_element(By.CLASS_NAME, 'next')
+            next_btn.click()
+            # 等待页面切换完成：active 页码变化
+            WebDriverWait(driver, 5).until(
+                lambda _: pagination.find_element(By.CLASS_NAME, 'active').text != active_before
+            )
+        except:
+            break   # 没有下一页了
+
+    if not courses:
+        print("> 未找到课程列表，请检查页面是否加载完整")
+        return []
 
     os.system('cls')
     print_banner()
 
     print("\n======================")
-    print("> 检测到以下课程：")
-    for idx, wrapper in enumerate(course_wrappers, 1):
-        try:
-            title = wrapper.find_element(By.CLASS_NAME, 'title').text
-            print(f"  {idx}. {title}")
-        except:
-            print(f"  {idx}. [无法读取课程名]")
+    print(f"> 检测到以下课程（共 {len(courses)} 门）：")
+    for idx, (title, _) in enumerate(courses, 1):
+        print(f"  {idx}. {title}")
     print("-----------------------")
+    print("> 输入课程编号（空格分隔），如: 1 2 3")
+    print("> 将按输入顺序依次刷课")
 
     try:
-        choice = int(input("\n请输入课程编号（输入数字后按 Enter）: "))
-        if choice < 1 or choice > len(course_wrappers):
-            print("> 编号超出范围，程序退出")
+        raw = input("\n请输入课程编号: ").strip()
+        choices = [int(x) for x in raw.split()]
+        selected = []
+        for c in choices:
+            if c < 1 or c > len(courses):
+                print(f"> 编号 {c} 超出范围，已跳过")
+                continue
+            selected.append(courses[c - 1])
+        if not selected:
+            print("> 无有效课程编号，程序退出")
             input("\n按 Enter 键退出...")
             sys.exit()
     except ValueError:
@@ -689,13 +810,8 @@ def select_course(driver):
         input("\n按 Enter 键退出...")
         sys.exit()
 
-    selected = course_wrappers[choice - 1]
-    course_item = selected.find_element(By.CLASS_NAME, 'course-item')
-    course_id = course_item.get_attribute('id').replace('courseCard', '')
-    textbook_url = f"https://lms.dgut.edu.cn/ulearning/index.html#/course/textbook?courseId={course_id}"
-    print(f"> 已选择第 {choice} 门课程，正在跳转到课件页面...")
-    driver.get(textbook_url)
-    t.sleep(3)
+    print(f"> 已选择 {len(selected)} 门课程: {', '.join(t for t, _ in selected)}")
+    return selected
 
 
 # ========== 主函数 ==========
@@ -811,55 +927,53 @@ def main():
         sys.exit()
 
     # ===== 登录成功，开始刷课 =====
-    # 课程选择
-    select_course(driver)
+    selected_courses = select_course(driver)
+    if not selected_courses:
+        print("> 未选择任何课程，程序退出")
+        input("\n按 Enter 键退出...")
+        driver.quit()
+        sys.exit()
 
-    # 遍历并输出课件章节列表
+    for course_idx, (title, course_id) in enumerate(selected_courses, 1):
+        print(f"\n{'='*30}")
+        print(f"> 第 {course_idx}/{len(selected_courses)} 门: {title}")
+        print(f"{'='*30}")
+
+        textbook_url = f"https://lms.dgut.edu.cn/ulearning/index.html#/course/textbook?courseId={course_id}"
+        driver.get(textbook_url)
+        t.sleep(3)
+
+        # 遍历并输出当前课件的学习界面
+        learn_list, is_list = get_learn_tabs(driver)
+
+        t.sleep(5)
+
+        # 进入主流程
+        print("\n======================")
+        print("> 开始自动刷课\n")
+
+        for idx in range(len(learn_list)):
+            if is_list:
+                # 每次循环重新获取最新的 DOM 引用，避免 stale element
+                learn_list, _ = get_learn_tabs(driver)
+                if idx >= len(learn_list):
+                    break
+            process_learn_tab(driver, actions, learn_list[idx], is_list, all_cookies)
+
+        print(f"\n> 课程「{title}」已完成")
+
+        # 回到课程列表，准备下一门
+        if course_idx < len(selected_courses):
+            driver.get(COURSE_LIST_URL)
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, 'course-item-wrapper'))
+                )
+            except:
+                pass
+
     print("\n======================")
-    print("> 课件章节列表：\n")
-    chapter_rows = driver.find_elements(By.XPATH, '//tr[starts-with(@id, "chapterTr")]')
-    if chapter_rows:
-        for row in chapter_rows:
-            try:
-                name = row.find_element(By.CLASS_NAME, 'tabchapter-name').text
-            except:
-                name = "未知章节"
-            try:
-                progress = row.find_element(By.XPATH, './/td[2]/span').text
-            except:
-                progress = "--"
-            try:
-                time = row.find_element(By.XPATH, './/td[3]').text
-            except:
-                time = "--"
-            try:
-                score = row.find_element(By.XPATH, './/td[4]').text
-            except:
-                score = "--"
-            try:
-                btn_text = row.find_element(By.CLASS_NAME, 'button-red-hollow').text
-            except:
-                btn_text = "--"
-            print(f"  {name}")
-            print(f"    进度: {progress}  学时: {time}  得分: {score}  [{btn_text}]")
-        print(f"\n> 共 {len(chapter_rows)} 个章节")
-    else:
-        print("> 未检测到章节列表")
-
-    # 遍历并输出当前课件的学习界面
-    learn_list, is_list = get_learn_tabs(driver)
-
-    t.sleep(5)
-
-    # 进入主流程
-    print("\n======================")
-    print("> 开始自动刷课\n")
-
-    for learn_page in learn_list:
-        process_learn_tab(driver, actions, learn_page, is_list, all_cookies)
-
-    t.sleep(600)
-    print("<程序已经运行结束>")
+    print("<所有课程已处理完毕>")
     driver.quit()
     sys.exit()
 

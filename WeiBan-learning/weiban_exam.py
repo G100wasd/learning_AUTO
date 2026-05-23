@@ -25,7 +25,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 EDGE_DRIVER_PATH = os.path.join(BASE_DIR, "msedgedriver.exe")
-USER_DATA_DIR = os.path.join(BASE_DIR, "edge_profile")
+COOKIE_FILE = os.path.join(BASE_DIR, "cookies.json")
 SCREENSHOT_PATH = os.path.join(BASE_DIR, "click.png")
 
 TARGET_URL = (
@@ -60,6 +60,76 @@ def take_screenshot(driver):
 
 
 # ============================================================
+# Cookie 持久化
+# ============================================================
+def get_browser_storage(driver):
+    """读取浏览器localStorage和sessionStorage，打印调试信息"""
+    ls = driver.execute_script("""
+        var items = {};
+        for (var i = 0; i < localStorage.length; i++) {
+            var key = localStorage.key(i);
+            items[key] = localStorage.getItem(key);
+        }
+        return items;
+    """)
+    ss = driver.execute_script("""
+        var items = {};
+        for (var i = 0; i < sessionStorage.length; i++) {
+            var key = sessionStorage.key(i);
+            items[key] = sessionStorage.getItem(key);
+        }
+        return items;
+    """)
+    print(f"\n  [debug] localStorage ({len(ls)} 项): {json.dumps(ls, ensure_ascii=False)}")
+    print(f"  [debug] sessionStorage ({len(ss)} 项): {json.dumps(ss, ensure_ascii=False)}")
+    return ls, ss
+
+
+def save_cookies_to_file(driver):
+    """保存当前浏览器cookies + localStorage + sessionStorage到文件"""
+    cookies = driver.get_cookies()
+    local_storage, session_storage = get_browser_storage(driver)
+    print(f"\n> 收集到 {len(cookies)} 个 Cookie")
+    try:
+        with open(COOKIE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                "cookies": cookies,
+                "localStorage": local_storage,
+                "sessionStorage": session_storage,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"> 已保存到 {COOKIE_FILE}")
+    except Exception as e:
+        print(f"[!] 保存失败: {e}")
+    return cookies, local_storage, session_storage
+
+
+def load_cookies_from_file():
+    """从文件加载cookies+storage，文件不存在时返回None"""
+    if not os.path.exists(COOKIE_FILE):
+        return None
+    try:
+        with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # 兼容旧格式（纯cookie列表）
+        if isinstance(data, list):
+            return {"cookies": data, "localStorage": {}, "sessionStorage": {}}
+        return data
+    except Exception:
+        return None
+
+
+def is_session_valid(driver):
+    """检查当前 weiban.mycourse.cn 会话是否有效"""
+    try:
+        time.sleep(2)
+        if "login" in driver.current_url.lower():
+            return False
+        return True
+    except:
+        return False
+
+
+# ============================================================
 # 浏览器初始化
 # ============================================================
 def check_driver():
@@ -71,7 +141,8 @@ def check_driver():
     return True
 
 
-def create_driver():
+def create_driver(headless=True):
+    """初始化Edge浏览器，headless=False 时有界面模式用于首次登录"""
     if not check_driver():
         raise FileNotFoundError(f"msedgedriver.exe 不存在于 {EDGE_DRIVER_PATH}")
 
@@ -80,7 +151,9 @@ def create_driver():
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(f"--user-data-dir={USER_DATA_DIR}")
+    options.add_argument("--window-size=1920,1080")
+    if headless:
+        options.add_argument("--headless")
     return webdriver.Edge(service=service, options=options)
 
 
@@ -88,57 +161,50 @@ def create_driver():
 # 登录
 # ============================================================
 def ensure_logged_in(driver):
-    first_run = not os.path.exists(os.path.join(USER_DATA_DIR, "Default"))
+    """使用已保存的Cookie+localStorage+sessionStorage自动登录，返回数据或 None（失败）"""
+    saved = load_cookies_from_file()
+    if saved is None:
+        return None
 
+    print("  [自动登录] 检测到已保存的凭据，尝试自动登录")
     driver.get("https://weiban.mycourse.cn/")
-    time.sleep(3)
+    time.sleep(2)
 
-    if "login" in driver.current_url.lower():
-        if not first_run:
-            # 尝试恢复：可能是页面跳转时序问题，导航回主页重试
-            print("\n  [尝试恢复] 检测到登录页，尝试刷新...")
-            driver.get("https://weiban.mycourse.cn/#/course")
-            time.sleep(4)
-            if "login" not in driver.current_url.lower():
-                print("  [OK] 恢复成功")
-                return "ok"
+    for cookie in saved.get("cookies", []):
+        try:
+            driver.add_cookie(cookie)
+        except:
+            pass
 
-            # 尝试清除 Cookies 后刷新
-            print("  [尝试恢复] 清除过期 Cookies 后重试...")
-            driver.delete_all_cookies()
-            driver.get("https://weiban.mycourse.cn/")
-            time.sleep(3)
-            if "login" not in driver.current_url.lower():
-                print("  [OK] 恢复成功")
-                return "ok"
+    ls = saved.get("localStorage", {})
+    if ls:
+        driver.execute_script("""
+            var data = arguments[0];
+            for (var key in data) {
+                localStorage.setItem(key, data[key]);
+            }
+        """, ls)
+    ss = saved.get("sessionStorage", {})
+    if ss:
+        driver.execute_script("""
+            var data = arguments[0];
+            for (var key in data) {
+                sessionStorage.setItem(key, data[key]);
+            }
+        """, ss)
+    if ls or ss:
+        print(f"  [OK] 已恢复 localStorage={len(ls)}项 sessionStorage={len(ss)}项")
 
-        # 所有自动恢复失败，让用户手动登录
-        print("\n" + "=" * 55)
-        if first_run:
-            print("  [首次运行] 请在浏览器中手动登录")
-        else:
-            print("  [登录已过期] 请重新登录")
-        print("=" * 55)
-        print("  登录后回到此终端按 Enter 继续")
-        print("=" * 55)
-        input()
-        time.sleep(3)
-        for _ in range(3):
-            if "login" not in driver.current_url.lower():
-                break
-            print("  等待登录完成...")
-            time.sleep(5)
+    # 直接导航到课程页，让 SPA 初始化时读 localStorage 拿 token
+    driver.get("https://weiban.mycourse.cn/#/course")
+    time.sleep(5)
 
-    if "login" in driver.current_url.lower():
-        print("[!] 登录超时")
-        return "failed"
-
-    if first_run:
-        print("  [OK] 登录成功，下次免登录")
-        return "just_logged_in"
+    if is_session_valid(driver):
+        print("  [OK] 自动登录成功")
+        return saved
     else:
-        print("  [OK] 已登录")
-        return "ok"
+        print("  [凭据已过期]")
+        return None
 
 
 def check_duplicate_login(driver) -> bool:
@@ -280,11 +346,14 @@ def find_course_element(driver, category_item, title: str):
 
 
 def cleanup_old_json():
-    """删除之前生成的所有 course_list JSON 文件。"""
+    """删除之前生成的所有 course_list JSON 文件及 Cookie 文件。"""
     pattern = os.path.join(BASE_DIR, "course_list_*.json")
     for f in glob.glob(pattern):
         os.remove(f)
         print(f"  删除旧文件: {os.path.basename(f)}")
+    if os.path.exists(COOKIE_FILE):
+        os.remove(COOKIE_FILE)
+        print(f"  删除Cookie文件: {os.path.basename(COOKIE_FILE)}")
 
 
 def save_course_list_json(all_courses: list[dict], total: int, passed: int):
@@ -1493,7 +1562,7 @@ def auto_complete(driver, all_courses: list[dict]):
                 if "login" in driver.current_url.lower():
                     print("  [!] 检测到登录页，尝试恢复...")
                     login_result = ensure_logged_in(driver)
-                    if login_result == "failed":
+                    if login_result is None:
                         print("  [!] 恢复失败，终止运行")
                         break
                     print("  [OK] 已恢复，继续下一课")
@@ -1532,21 +1601,71 @@ def main():
     print("微伴课程刷题助手")
     print("=" * 55)
 
+    # ===== 登录流程 =====
+    saved_cookies = load_cookies_from_file()
+
+    if saved_cookies is None:
+        # 首次使用：有界面模式登录获取Cookie
+        print("\n[1/3] 启动浏览器（首次登录）...")
+        try:
+            driver = create_driver(headless=False)
+        except Exception as e:
+            print(f"[!] 浏览器启动失败: {e}")
+            print(f"[!] 请确认 {EDGE_DRIVER_PATH} 存在且版本匹配")
+            input("\n按 Enter 退出...")
+            return
+
+        print("\n[2/3] 登录...")
+        print("\n" + "=" * 55)
+        print("  [首次运行] 请在浏览器中手动登录")
+        print("=" * 55)
+        print("  登录后回到此终端按 Enter 继续")
+        print("=" * 55)
+        driver.get("https://weiban.mycourse.cn/")
+        time.sleep(3)
+        input()
+        time.sleep(2)
+
+        # 跳转到课程页面确保Cookie完整
+        driver.get("https://weiban.mycourse.cn/#/course")
+        time.sleep(3)
+        if "login" in driver.current_url.lower():
+            print("[!] 登录失败，仍在登录页")
+            input("\n按 Enter 退出...")
+            driver.quit()
+            return
+
+        save_cookies_to_file(driver)
+        driver.quit()
+        print("\n" + "=" * 55)
+        print("  首次登录完成，请重新启动程序开始刷课")
+        print("=" * 55)
+        input("\n按 Enter 退出...")
+        return
+
+    # 有Cookie：无头模式自动登录
     print("\n[1/3] 启动 Edge 浏览器...")
     try:
-        driver = create_driver()
+        driver = create_driver(headless=False)
     except Exception as e:
         print(f"[!] 浏览器启动失败: {e}")
         print(f"[!] 请确认 {EDGE_DRIVER_PATH} 存在且版本匹配")
         input("\n按 Enter 退出...")
         return
-    driver.set_window_position(0, 0)
-    driver.set_window_size(650, driver.execute_script("return window.screen.availHeight"))
 
     try:
         print("\n[2/3] 登录...")
-        login_result = ensure_logged_in(driver)
-        if login_result == "failed":
+        saved_cookies = ensure_logged_in(driver)
+        if saved_cookies is None:
+            driver.quit()
+            try:
+                os.remove(COOKIE_FILE)
+                print("  [已删除过期Cookie文件]")
+            except:
+                pass
+            print("\n" + "=" * 55)
+            print("  Cookie已过期，请重新启动程序并重新登录")
+            print("=" * 55)
             input("\n按 Enter 退出...")
             return
 
@@ -1554,10 +1673,6 @@ def main():
         if check_duplicate_login(driver):
             input("\n请处理重复登录后按 Enter 退出...")
             return
-
-        # 如果刚登录，清除旧 JSON，后面会重新生成
-        if login_result == "just_logged_in":
-            cleanup_old_json()
 
         # --- 登录成功 → 清屏并输出艺术字 ---
         if os.name == "nt":
