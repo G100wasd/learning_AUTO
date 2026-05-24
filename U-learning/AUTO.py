@@ -9,7 +9,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import ElementClickInterceptedException, ElementNotInteractableException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 
 
 # ========== 常量 ==========
@@ -552,27 +557,33 @@ def process_section_pages(driver, actions, section_items):
 def process_chapters(driver, actions, chapter_list, start_index):
     """从 start_index 开始，遍历并处理所有专题"""
     for chapter_idx in range(start_index, len(chapter_list)):
-        # 重新获取最新DOM，避免stale element引用
-        chapters = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
-        if chapter_idx >= len(chapters):
-            break
-        chapter_item = chapters[chapter_idx]
-
         # 第一个专题从课表点进来时已默认展开，不需要再点
         if chapter_idx > start_index:
-            # 跳过弹窗再展开专题（带重试 + 显式等待，防止元素未渲染完成）
-            chapter_name_el = chapter_item.find_element(By.CLASS_NAME, 'chapter-name')
             for _ in range(5):
                 try:
-                    WebDriverWait(driver, 5).until(EC.element_to_be_clickable(chapter_name_el))
+                    # 每次重试重新查找，避免 stale element
+                    chapters = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
+                    if chapter_idx >= len(chapters):
+                        break
+                    chapter_name_el = chapters[chapter_idx].find_element(By.CLASS_NAME, 'chapter-name')
+                    WebDriverWait(driver, 5).until(
+                        lambda _: chapter_name_el.is_displayed() and chapter_name_el.is_enabled()
+                    )
                     chapter_name_el.click()
                     break
-                except (ElementClickInterceptedException, ElementNotInteractableException):
+                except (ElementClickInterceptedException, ElementNotInteractableException,
+                        StaleElementReferenceException, TimeoutException):
                     skip_all_tips(driver)
                     t.sleep(1)
         else:
             skip_all_tips(driver)
         t.sleep(1)
+
+        # 重新获取最新 DOM 后再读取章节信息
+        chapters = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
+        if chapter_idx >= len(chapters):
+            break
+        chapter_item = chapters[chapter_idx]
 
         section_items = chapter_item.find_element(By.CLASS_NAME, 'section-list').find_elements(By.CLASS_NAME, 'section-item')
         print(f"> 当前专题:{chapter_item.find_element(By.CLASS_NAME, 'text').text}")
