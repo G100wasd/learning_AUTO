@@ -12,6 +12,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
     ElementNotInteractableException,
+    NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
 )
@@ -103,6 +104,19 @@ def is_session_valid(driver):
         return True
     except:
         return False
+
+
+def log_error(error_type, error_msg, context=""):
+    """将错误信息追加写入当前用户目录下的 error.txt"""
+    log_dir = CUR_PHOTO_DIR or BASE_DIR
+    log_path = os.path.join(log_dir, "error.txt")
+    timestamp = t.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] [{error_type}] {context}: {error_msg}\n"
+    try:
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(line)
+    except:
+        pass
 
 
 def perform_login(driver, cookie_path):
@@ -345,6 +359,24 @@ def _parse_seconds(timestamp):
     return 0
 
 
+def _is_video_finished(video_element):
+    """检测 video-progress 的 DOM 完成标志"""
+    try:
+        progress = video_element.find_element(By.CLASS_NAME, 'video-progress')
+        cls = progress.get_attribute('class') or ''
+        if 'complete' in cls.split():
+            return True
+        try:
+            span = progress.find_element(By.CLASS_NAME, 'text').find_element(By.XPATH, './span')
+            if span.text == "已看完":
+                return True
+        except:
+            pass
+    except:
+        pass
+    return False
+
+
 def play_single_video(driver, actions, video_element):
     """播放单个视频并等待完成"""
     video = video_element.find_element(By.CLASS_NAME, 'mejs__container')
@@ -352,16 +384,15 @@ def play_single_video(driver, actions, video_element):
     t.sleep(1)
 
     # 检查是否已看完
-    video_check = video_element.find_element(By.CLASS_NAME, 'video-progress').find_element(By.CLASS_NAME, 'text').find_element(By.XPATH, './span')
-    if video_check.text == "已看完":
+    if _is_video_finished(video_element):
         print(">   该视频已看完")
         return
 
     t.sleep(1)
-    # 获取控制组件
+    # 获取控制组件（仅用于初始静音和播放）
     video_control = video.find_element(By.CLASS_NAME, 'mejs__controls')
-    video_play_btn = video_control.find_element(By.CLASS_NAME, 'mejs__play').find_element(By.XPATH, './button')
     video_volumn = video_control.find_element(By.CLASS_NAME, 'mejs__volume-button').find_element(By.XPATH, './button')
+    video_play_btn = video_control.find_element(By.CLASS_NAME, 'mejs__play').find_element(By.XPATH, './button')
 
     # 静音并播放
     actions.click(video_volumn).perform()
@@ -372,17 +403,36 @@ def play_single_video(driver, actions, video_element):
 
     # 输出视频总时长信息
     video_time = video_control.find_element(By.CLASS_NAME, 'mejs__duration-container').find_element(By.XPATH, './span').text
+    if not video_time or _parse_seconds(video_time) == 0:
+        print(">   无法获取视频时长，等待 60 秒后检查...")
+        t.sleep(60)
+        try:
+            video_control = video.find_element(By.CLASS_NAME, 'mejs__controls')
+            video_time = video_control.find_element(By.CLASS_NAME, 'mejs__duration-container').find_element(By.XPATH, './span').text
+        except:
+            video_time = "0:01"
     total_sec = _parse_seconds(video_time)
+    if total_sec == 0:
+        total_sec = 60  # 保底值，至少等一分钟
     # 向上取整到整分钟，余数 > 30s 再加 1 分钟
     base = ((total_sec + 59) // 60) * 60
     remain_sec = base + (60 if total_sec % 60 > 30 else 0)
     print(f">   视频时长: {video_time}（整为 {remain_sec // 60} 分钟）")
 
-    # 每60秒检测一次视频是否播完（播完后进度条自动归 00:00）
+    # 每60秒检测一次视频是否播完
     check_count = 0
     while check_count * 60 < remain_sec:
         t.sleep(60)
-        # 先读取时间再操作，防止播完后误触发 replay
+        # 优先检测 DOM 完成标志，再检测播放器时间归零
+        if _is_video_finished(video_element):
+            print("\n>   视频已看完（完成标志）")
+            driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
+            return
+        # 每次循环重新获取控制组件，避免 stale element
+        try:
+            video_control = video.find_element(By.CLASS_NAME, 'mejs__controls')
+        except:
+            break
         try:
             cur_text = video_control.find_element(By.CLASS_NAME, 'mejs__currenttime-container').find_element(By.XPATH, './span').text
         except:
@@ -391,11 +441,27 @@ def play_single_video(driver, actions, video_element):
             print("\n>   视频已看完")
             driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
             return
+        # 防挂机前先检查是否有挂机提醒弹窗
+        try:
+            modal = driver.find_element(By.CLASS_NAME, 'modal-content')
+            if modal.is_displayed():
+                btn = modal.find_element(By.CLASS_NAME, 'btn-submit')
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    print("\n>   检测到挂机提醒，已点击继续学习")
+                    t.sleep(2)
+        except:
+            pass
+
         # 防挂机：暂停 → 截图 → 恢复
-        actions.click(video_play_btn).perform()
-        t.sleep(1)
-        driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
-        actions.click(video_play_btn).perform()
+        try:
+            video_play_btn = video_control.find_element(By.CLASS_NAME, 'mejs__play').find_element(By.XPATH, './button')
+            actions.click(video_play_btn).perform()
+            t.sleep(1)
+            driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_vedio.png"))
+            actions.click(video_play_btn).perform()
+        except:
+            pass
         check_count += 1
         print(f"\r>   防挂机检测X{check_count}", end="", flush=True)
     t.sleep(1)
@@ -405,15 +471,16 @@ def handle_video_content(driver, actions):
     """检测并处理视频类型内容，返回 True 如果成功处理"""
     try:
         driver.find_element(By.CLASS_NAME, 'video-element')
-        video_elements = driver.find_elements(By.CLASS_NAME, 'video-element')
-        print("> 当前部分 : 视频")
-        print(f"> 数量: {len(video_elements)}")
-        for video_count, video_element in enumerate(video_elements, 1):
-            print(f">   视频{video_count}")
-            play_single_video(driver, actions, video_element)
-        return True
-    except:
+    except NoSuchElementException:
         return False
+
+    video_elements = driver.find_elements(By.CLASS_NAME, 'video-element')
+    print("> 当前部分 : 视频")
+    print(f"> 数量: {len(video_elements)}")
+    for video_count, video_element in enumerate(video_elements, 1):
+        print(f">   视频{video_count}")
+        play_single_video(driver, actions, video_element)
+    return True
 
 
 # ========== 学习流程 - 答题处理 ==========
@@ -489,64 +556,117 @@ def handle_question_content(driver, actions):
 
 # ========== 学习流程 - 页面项处理 ==========
 
+def _reclick_page_item(driver, title_text):
+    """刷新后在 DOM 中根据标题重新找到并点击 page-item，返回 (page_item, page_name) 或 (None, None)"""
+    try:
+        all_items = driver.find_elements(By.CLASS_NAME, 'page-item')
+        for pi in all_items:
+            try:
+                pn = pi.find_element(By.CLASS_NAME, 'page-name')
+                pt = pn.find_element(By.CLASS_NAME, 'text').find_element(By.XPATH, './span')
+                if pt.get_attribute('textContent').strip() == title_text:
+                    return pi, pn
+            except:
+                continue
+    except:
+        pass
+    return None, None
+
+
 def process_page_item(driver, actions, page_item):
-    """处理单个页面项（视频或题目）"""
-    page_name = page_item.find_element(By.CLASS_NAME, 'page-name')
-    title_el = page_name.find_element(By.CLASS_NAME, 'text').find_element(By.XPATH, './span')
-    title_text = title_el.get_attribute('textContent').strip()
+    """处理单个页面项（视频或题目），带10次刷新重试和错误日志"""
+    try:
+        page_name = page_item.find_element(By.CLASS_NAME, 'page-name')
+        title_el = page_name.find_element(By.CLASS_NAME, 'text').find_element(By.XPATH, './span')
+        title_text = title_el.get_attribute('textContent').strip()
+    except Exception as e:
+        log_error(type(e).__name__, str(e)[:200], "process_page_item 初始化")
+        print(">   无法读取页面项信息，已跳过")
+        return
+
     os.system('cls')
     print_banner()
     print("\n-----------------------")
     print(f"> 当前项目:{title_text}")
 
-    # 检查是否已完成
-    class_attr = page_name.get_attribute('class')
-    if 'complete' in class_attr.split():
-        print(">   状态: 已完成")
-        print("-----------------------")
+    try:
+        class_attr = page_name.get_attribute('class')
+        if 'complete' in class_attr.split():
+            print(">   状态: 已完成")
+            print("-----------------------")
+            return
+    except StaleElementReferenceException:
+        log_error("StaleElementReferenceException", "page_name 在完成检测时已失效", title_text)
+        print(">   页面项引用失效，已跳过")
         return
 
-    driver.execute_script("arguments[0].scrollIntoView();", page_name)
-    for _ in range(3):
-        try:
-            actions.click(page_name).perform()
-            break
-        except ElementNotInteractableException:
-            driver.execute_script("arguments[0].click();", page_name)
-            break
-        except ElementClickInterceptedException:
+    for attempt in range(10):
+        if attempt > 0:
+            print(f"> 刷新重试 ({attempt + 1}/10)...")
+            driver.refresh()
+            t.sleep(3)
             skip_all_tips(driver)
-            t.sleep(1)
-    t.sleep(2)
-    for _ in range(3):
+            page_item, page_name = _reclick_page_item(driver, title_text)
+            if page_item is None:
+                print(f">   刷新后未找到项目「{title_text}」，继续重试...")
+                continue
+
         try:
-            actions.click(page_name).perform()
-            break
-        except ElementNotInteractableException:
-            driver.execute_script("arguments[0].click();", page_name)
-            break
-        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].scrollIntoView();", page_name)
+            for _ in range(3):
+                try:
+                    actions.click(page_name).perform()
+                    break
+                except ElementNotInteractableException:
+                    driver.execute_script("arguments[0].click();", page_name)
+                    break
+                except ElementClickInterceptedException:
+                    skip_all_tips(driver)
+                    t.sleep(1)
+            t.sleep(2)
+            for _ in range(3):
+                try:
+                    actions.click(page_name).perform()
+                    break
+                except ElementNotInteractableException:
+                    driver.execute_script("arguments[0].click();", page_name)
+                    break
+                except ElementClickInterceptedException:
+                    skip_all_tips(driver)
+                    t.sleep(1)
+            driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_start.png"))
+            t.sleep(2)
+
             skip_all_tips(driver)
+
+            if not handle_video_content(driver, actions):
+                handle_question_content(driver, actions)
+
+            driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_end.png"))
+            print("-----------------------")
             t.sleep(1)
-    driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_start.png"))
-    t.sleep(2)
+            return
 
-    # 跳过可能出现的引导弹窗
-    skip_all_tips(driver)
-
-    # 先检测视频，再检测题目
-    if not handle_video_content(driver, actions):
-        handle_question_content(driver, actions)
-
-    driver.save_screenshot(os.path.join(CUR_PHOTO_DIR or BASE_DIR, "cur_end.png"))
-    print("-----------------------")
-    t.sleep(1)
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = str(e)[:200]
+            if attempt < 9:
+                print(f">   捕获异常 [{error_type}]，准备刷新重试...")
+            else:
+                log_error(error_type, error_msg, title_text)
+                print(f">   10次重试后仍失败 [{error_type}]，已跳过此项目")
+                print(f">   详情已写入 error.txt")
+                print("-----------------------")
 
 
 def process_section_pages(driver, actions, section_items):
     """遍历一个section下的所有page items"""
-    for section_item in section_items:
-        page_items = section_item.find_element(By.CLASS_NAME, 'page-list').find_elements(By.CLASS_NAME, 'page-item')
+    for idx, section_item in enumerate(section_items):
+        try:
+            page_items = section_item.find_element(By.CLASS_NAME, 'page-list').find_elements(By.CLASS_NAME, 'page-item')
+        except (StaleElementReferenceException, NoSuchElementException):
+            print(f"> section-item {idx} 失效，跳过")
+            continue
         t.sleep(1)
         for page_item in page_items:
             process_page_item(driver, actions, page_item)
@@ -580,13 +700,22 @@ def process_chapters(driver, actions, chapter_list, start_index):
         t.sleep(1)
 
         # 重新获取最新 DOM 后再读取章节信息
-        chapters = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
+        try:
+            chapters = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
+        except NoSuchElementException:
+            print("> catalog-list 丢失，跳过当前专题")
+            break
         if chapter_idx >= len(chapters):
             break
         chapter_item = chapters[chapter_idx]
 
-        section_items = chapter_item.find_element(By.CLASS_NAME, 'section-list').find_elements(By.CLASS_NAME, 'section-item')
-        print(f"> 当前专题:{chapter_item.find_element(By.CLASS_NAME, 'text').text}")
+        try:
+            section_items = chapter_item.find_element(By.CLASS_NAME, 'section-list').find_elements(By.CLASS_NAME, 'section-item')
+            chapter_text = chapter_item.find_element(By.CLASS_NAME, 'text').text
+        except (StaleElementReferenceException, NoSuchElementException):
+            print(f"> 专题 {chapter_idx} 元素失效，跳过")
+            continue
+        print(f"> 当前专题:{chapter_text}")
         print("-----------------------")
         t.sleep(1)
 
@@ -654,6 +783,15 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
         actions.click(learn_page).perform()
         t.sleep(2)
 
+    # 检查该学习界面是否已被教师隐藏
+    try:
+        hide_page = driver.find_element(By.CLASS_NAME, 'hide-page')
+        if hide_page.is_displayed():
+            print("> 该课件已被教师隐藏，跳过")
+            return
+    except NoSuchElementException:
+        pass
+
     # 等待并打印当前学习界面的完整章节列表
     for attempt in range(3):
         try:
@@ -713,7 +851,16 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
         if not learn_btn:
             print("> 未找到开始学习按钮")
             break
-        actions.click(learn_btn[0]).perform()
+        for _ in range(3):
+            try:
+                actions.click(learn_btn[0]).perform()
+                break
+            except ElementClickInterceptedException:
+                skip_all_tips(driver)
+                t.sleep(1)
+            except ElementNotInteractableException:
+                driver.execute_script("arguments[0].click();", learn_btn[0])
+                break
 
         # 处理新窗口的 undefined/401
         handle_new_window(driver, all_cookies)
@@ -731,7 +878,7 @@ def process_learn_tab(driver, actions, learn_page, is_list, all_cookies):
         chapter_list = driver.find_element(By.CLASS_NAME, 'catalog-list').find_elements(By.CLASS_NAME, 'chapter-item')
         print(f"> 该部分有{len(chapter_list)}个专题")
 
-        process_chapters(driver, actions, chapter_list, index)
+        process_chapters(driver, actions, chapter_list, 0)
 
         # 所有专题处理完毕，点击返回按钮保存
         click_back_save(driver)
@@ -821,7 +968,9 @@ def select_course(driver):
         input("\n按 Enter 键退出...")
         sys.exit()
 
-    print(f"> 已选择 {len(selected)} 门课程: {', '.join(t for t, _ in selected)}")
+    print(f"> 已选择 {len(selected)} 门课程：")
+    for title, cid in selected:
+        print(f"    {title} : {cid}")
     return selected
 
 
@@ -950,7 +1099,7 @@ def main():
         print(f"> 第 {course_idx}/{len(selected_courses)} 门: {title}")
         print(f"{'='*30}")
 
-        textbook_url = f"https://lms.dgut.edu.cn/ulearning/index.html#/course/textbook?courseId={course_id}"
+        textbook_url = f"https://lms.dgut.edu.cn/courseweb/ulearning/index.html#/course/textbook?courseId={course_id}"
         driver.get(textbook_url)
         t.sleep(3)
 
